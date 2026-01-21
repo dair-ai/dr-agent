@@ -1,19 +1,24 @@
 /**
- * Vercel Sandbox Runner
+ * Vercel Sandbox Runner for Research Agent
  *
- * Executes the research pipeline in an isolated Vercel Sandbox container.
- * This is necessary for production deployment because Vercel serverless
- * functions cannot spawn subprocesses (which the Claude Agent SDK requires).
+ * Runs the Claude Agent SDK in an isolated container environment
+ * to work around Vercel serverless limitations (no subprocess spawning).
  */
 
-import { Sandbox } from '@vercel/sandbox';
-import type { ResearchStage, Source } from '@/types/research';
+import { Sandbox } from "@vercel/sandbox";
+import type { Source } from "@/types/research";
+
+export interface SandboxMessage {
+  type: "stdout" | "stderr" | "status" | "result" | "error";
+  data: string;
+  timestamp: number;
+}
 
 export interface SandboxCallbacks {
-  onStageChange: (stage: ResearchStage, status: 'active' | 'completed' | 'error', message?: string) => void;
-  onStatus: (message: string, stage: ResearchStage) => void;
+  onStageChange: (stage: string, status: "active" | "completed" | "error", message?: string) => void;
+  onStatus: (message: string, stage: string) => void;
   onSource: (source: Source) => void;
-  onError: (error: string, stage?: ResearchStage) => void;
+  onError: (error: string, stage?: string) => void;
 }
 
 export interface SandboxResult {
@@ -23,358 +28,512 @@ export interface SandboxResult {
   error?: string;
 }
 
+export interface RunResearchOptions {
+  topic: string;
+  sessionId?: string;
+  anthropicApiKey: string;
+  exaApiKey: string;
+  onMessage?: (message: SandboxMessage) => void;
+}
+
 /**
- * Generate the research script that will run inside the sandbox
+ * The research script that runs inside the sandbox
+ * Uses the Claude Agent SDK for multi-agent orchestration
  */
-function generateResearchScript(topic: string): string {
-  // Escape the topic for safe embedding in JavaScript
-  const escapedTopic = topic
-    .replace(/\\/g, '\\\\')
-    .replace(/`/g, '\\`')
-    .replace(/\$/g, '\\$');
+function getResearchScript(topic: string, exaApiKey: string, sessionId?: string): string {
+  const escapedTopic = topic.replace(/`/g, "\\`").replace(/\$/g, "\\$").replace(/"/g, '\\"');
+  const sessionIdArg = sessionId ? `"${sessionId}"` : "undefined";
 
   return `
-import Anthropic from '@anthropic-ai/sdk';
-import Exa from 'exa-js';
+const { query, createSdkMcpServer, tool } = require("@anthropic-ai/claude-agent-sdk");
+const { z } = require("zod");
+const Exa = require("exa-js").default;
 
-// Output helper - prefix messages for parsing
-const emit = (msg) => console.log('__MSG__' + JSON.stringify(msg));
+// API key passed from parent environment
+const EXA_API_KEY = "${exaApiKey}";
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+// Initialize Exa client (lazy singleton)
+let exaClient = null;
+const getExaClient = () => {
+  if (exaClient) return exaClient;
+  console.log("[Exa] Creating client...");
+  exaClient = new Exa(EXA_API_KEY);
+  return exaClient;
+};
 
-const getExaClient = () => new Exa(process.env.EXA_API_KEY);
+// Create Exa search tools using Agent SDK MCP server
+const exaSearchTools = createSdkMcpServer({
+  name: "exa-research",
+  version: "1.0.0",
+  tools: [
+    tool(
+      "search",
+      "Search the web using neural or keyword search.",
+      {
+        query: z.string().describe("Search query"),
+        type: z.enum(["neural", "keyword"]).default("neural").describe("Search type"),
+        num_results: z.number().default(10).describe("Number of results"),
+        start_published_date: z.string().optional().describe("Filter: published after (YYYY-MM-DD)"),
+        end_published_date: z.string().optional().describe("Filter: published before (YYYY-MM-DD)")
+      },
+      async (args) => {
+        console.log("[Exa] search:", args.query.substring(0, 50) + "...");
+        try {
+          const exa = getExaClient();
+          const options = {
+            type: args.type,
+            numResults: args.num_results,
+            useAutoprompt: true,
+            contents: { text: { maxCharacters: 1500 } }
+          };
+          if (args.start_published_date) options.startPublishedDate = args.start_published_date;
+          if (args.end_published_date) options.endPublishedDate = args.end_published_date;
 
-// Subagent prompts
-const PLANNER_PROMPT = \`You are a research planning specialist. Your job is to analyze a research topic and create an optimal search strategy.
+          const results = await exa.searchAndContents(args.query, options);
+          console.log("[Exa] search done:", results.results.length, "results");
 
-IMPORTANT: Pay close attention to TEMPORAL INTENT in the query:
-- Words like "latest", "recent", "current", "today", "this week", "this month", "2024", "2025" indicate time-sensitive queries
-- For "latest news" or "recent developments" → use last 30 days
-- For "this year" or current year mentions → use start of that year to today
-- For historical or conceptual topics (no time indicators) → set isTimeSensitive to false
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                query: args.query,
+                total: results.results.length,
+                results: results.results.map(r => ({
+                  title: r.title || "Untitled",
+                  url: r.url,
+                  author: r.author || "Unknown",
+                  published_date: r.publishedDate || "Unknown",
+                  text: r.text || null
+                }))
+              }, null, 2)
+            }]
+          };
+        } catch (error) {
+          console.error("[Exa] search FAILED:", error.message);
+          return { content: [{ type: "text", text: JSON.stringify({ error: true, message: error.message }) }] };
+        }
+      }
+    ),
+    tool(
+      "get_contents",
+      "Get full content from URLs.",
+      {
+        urls: z.array(z.string()).describe("URLs to fetch"),
+        max_characters: z.number().default(3000).describe("Max chars per doc")
+      },
+      async (args) => {
+        console.log("[Exa] get_contents:", args.urls.length, "urls");
+        try {
+          const exa = getExaClient();
+          const contents = await exa.getContents(args.urls, { text: { maxCharacters: args.max_characters } });
+          console.log("[Exa] get_contents done:", contents.results.length, "docs");
 
-Given a research topic, you will:
-1. Analyze the key concepts and determine if the query is time-sensitive
-2. Generate 3-5 diverse search queries that cover different angles
-3. Recommend search types (neural for conceptual understanding, keyword for specific terms)
-4. If time-sensitive, calculate appropriate date ranges relative to TODAY'S DATE (provided below)
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                documents: contents.results.map(doc => ({
+                  url: doc.url,
+                  title: doc.title || "Untitled",
+                  author: doc.author || "Unknown",
+                  text: doc.text || "No content"
+                }))
+              }, null, 2)
+            }]
+          };
+        } catch (error) {
+          console.error("[Exa] get_contents FAILED:", error.message);
+          return { content: [{ type: "text", text: JSON.stringify({ error: true, message: error.message }) }] };
+        }
+      }
+    ),
+    tool(
+      "find_similar",
+      "Find content similar to a given URL.",
+      {
+        url: z.string().describe("URL to find similar content for"),
+        num_results: z.number().default(5).describe("Number of similar results"),
+        exclude_source_domain: z.boolean().default(true).describe("Exclude results from same domain")
+      },
+      async (args) => {
+        console.log("[Exa] find_similar:", args.url.substring(0, 50) + "...");
+        try {
+          const exa = getExaClient();
+          const results = await exa.findSimilar(args.url, {
+            numResults: args.num_results,
+            excludeSourceDomain: args.exclude_source_domain
+          });
+          console.log("[Exa] find_similar done:", results.results.length, "results");
 
-Output your plan as a JSON object with this structure:
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                source_url: args.url,
+                similar: results.results.map(r => ({
+                  title: r.title || "Untitled",
+                  url: r.url,
+                  author: r.author || "Unknown"
+                }))
+              }, null, 2)
+            }]
+          };
+        } catch (error) {
+          console.error("[Exa] find_similar FAILED:", error.message);
+          return { content: [{ type: "text", text: JSON.stringify({ error: true, message: error.message }) }] };
+        }
+      }
+    )
+  ]
+});
+
+// Orchestrator system prompt
+const ORCHESTRATOR_PROMPT = \`You are a Research Orchestrator that coordinates a multi-agent research pipeline.
+
+## Your Pipeline
+You have 3 specialized subagents to delegate to in sequence:
+
+1. **planner-agent**: Creates optimized search queries and date ranges
+2. **web-search-agent**: Gathers sources from the web (has Exa search tools)
+3. **report-writer-agent**: Writes the final research report from gathered sources
+
+## Workflow
+For EVERY research request, follow this exact sequence:
+
+### Step 1: Planning
+Announce: "STAGE: planner - Creating optimized search strategy..."
+Call planner-agent with topic and current date.
+
+### Step 2: Web Search
+Announce: "STAGE: web-search - Gathering sources from the web..."
+Call web-search-agent with the search plan.
+
+### Step 3: Report Writing
+Announce: "STAGE: report-writer - Generating report..."
+Call report-writer-agent with the gathered sources.
+
+### Step 4: Output Report
+OUTPUT THE COMPLETE REPORT EXACTLY AS RECEIVED FROM report-writer-agent.
+
+## Critical Output Rules
+- ALWAYS use all 3 agents in sequence and announce each STAGE
+- **IMPORTANT: After report-writer completes, output the ENTIRE report verbatim**
+- **DO NOT add commentary, summaries, or emojis after the report**
+- **DO NOT say "Here's the report" or "Pipeline complete" - just output the report**
+- The final output should be ONLY the markdown report from report-writer-agent\`;
+
+// Subagent definitions
+const SUBAGENTS = {
+  "planner-agent": {
+    description: "Creates search queries with date ranges for a research topic.",
+    tools: [],
+    prompt: \`You are a Research Planner. Create exactly 4 search queries for the given topic.
+
+## Temporal Analysis
+Pay attention to TEMPORAL INTENT in the query:
+- Words like "latest", "recent", "current" indicate time-sensitive queries
+- For "latest news" -> use last 30 days
+- For "this year" -> use start of that year to today
+- For historical topics -> use last 6 months as default
+
+## Output Format
+Return JSON only:
+\\\`\\\`\\\`json
 {
-  "queries": ["query1", "query2", ...],
-  "searchTypes": ["neural", "keyword", ...],
-  "isTimeSensitive": true/false,
-  "dateRange": { "startDate": "YYYY-MM-DD", "endDate": "YYYY-MM-DD" } or null if not time-sensitive,
-  "rationale": "Brief explanation including why dates were chosen"
+  "date_range": {
+    "start_published_date": "YYYY-MM-DD",
+    "end_published_date": "YYYY-MM-DD"
+  },
+  "search_queries": [
+    {"query": "search query", "type": "neural", "num_results": 3}
+  ]
 }
+\\\`\\\`\\\`
 
-IMPORTANT:
-- Do NOT include "domains" field - let the search engine find the best sources
-- For time-sensitive queries, ALWAYS set appropriate dateRange relative to today's date
-- For evergreen/conceptual topics, set isTimeSensitive to false and dateRange to null\`;
+Generate exactly 4 queries with a mix of neural and keyword searches.\`,
+    model: "haiku"
+  },
+  "web-search-agent": {
+    description: "Executes search queries and gathers sources using Exa tools.",
+    tools: ["mcp__exa-research__search", "mcp__exa-research__get_contents"],
+    prompt: \`Execute the search plan provided. For each query, call the search tool with the date range.
 
-const WRITER_PROMPT = \`You are a research report writer. Your job is to synthesize research findings into a comprehensive, well-structured report.
+After ALL searches complete, pick the 6-8 best URLs and call get_contents ONCE.
 
-Your output should be a well-formatted Markdown report with:
+Return sources as a structured list:
+- Title: [title]
+- URL: [url]
+- Published: [date]
+- Content: [key content summary]
 
-## Structure
-1. **Executive Summary** - 2-3 paragraph overview of key findings
-2. **Introduction** - Context and scope of the research
-3. **Key Findings** - Main sections organized by theme (use ### for subsections)
-4. **Analysis** - Deeper insights, connections between sources, implications
-5. **Limitations** - Gaps in available information, areas needing more research
-6. **Conclusion** - Summary and potential next steps
-7. **Sources** - Numbered list of all sources used
+Be efficient. No lengthy explanations.\`,
+    model: "haiku"
+  },
+  "report-writer-agent": {
+    description: "Writes the final research report from gathered sources.",
+    tools: [],
+    prompt: \`You are a Research Report Writer. Create a comprehensive report with:
 
-## Guidelines
-- Be objective and balanced
-- Cite sources inline using [Source N] notation
-- Use bullet points for lists of related items
-- Include relevant quotes when they add value (keep them brief)
-- Highlight areas of consensus and disagreement
-- Note the recency and authority of sources
-- Write for an informed but not expert audience
+## Report Structure
+# [Report Title]
 
-The report should be thorough (1500-2500 words) but focused on the most valuable insights.\`;
+## Executive Summary
+2-3 paragraphs summarizing key findings.
 
-// Search helper
-async function searchWeb(query, type = 'neural', numResults = 10, startDate, endDate) {
-  const exa = getExaClient();
-  try {
-    const results = await exa.search(query, {
-      type,
-      numResults,
-      startPublishedDate: startDate,
-      endPublishedDate: endDate,
-      useAutoprompt: type === 'neural',
-    });
-    return { success: true, results: results.results };
-  } catch (error) {
-    return { success: false, error: error.message };
+## Introduction
+Context and scope of the research.
+
+## Key Findings
+3-5 sections by theme. Cite sources inline as [Source N].
+
+## Analysis
+Deeper insights and implications.
+
+## Limitations
+Gaps in available information.
+
+## Conclusion
+Summary and next steps.
+
+## Sources
+[N] Title - URL
+
+Target 1,500-2,500 words. Be objective and cite every claim.\`,
+    model: "haiku"
   }
-}
+};
 
-// Get contents helper
-async function getContents(urls, maxChars = 8000) {
-  const exa = getExaClient();
+// Configuration for the orchestrator
+const config = {
+  model: "claude-haiku-4-5-20251001",
+  systemPrompt: ORCHESTRATOR_PROMPT,
+  mcpServers: {
+    "exa-research": exaSearchTools
+  },
+  agents: SUBAGENTS,
+  allowedTools: [
+    "mcp__exa-research__search",
+    "mcp__exa-research__get_contents",
+    "mcp__exa-research__find_similar"
+  ],
+  disallowedTools: ["WebFetch", "WebSearch"],
+  permissionMode: "bypassPermissions"
+};
+
+// Build the research prompt
+const currentDateTime = new Date().toISOString();
+const topic = "${escapedTopic}";
+const prompt = \`Conduct deep research on the following topic and provide a comprehensive report:
+
+**Research Topic:** \${topic}
+
+**Current Date/Time:** \${currentDateTime}
+
+Please use this date/time information to:
+1. Set appropriate date ranges for searching (the planner agent should use this)
+2. Prioritize recent vs historical sources based on the topic
+3. Filter out outdated information when researching current events
+
+Pipeline Instructions:
+1. First, call the planner-agent to create an optimized search strategy with date ranges
+2. Then, pass the search plan to web-search-agent to gather sources
+3. Finally, pass sources to report-writer-agent for the final report
+
+IMPORTANT: Announce each stage transition with "STAGE: [agent-name] - [description]"
+
+Start the research pipeline now.\`;
+
+async function runResearch() {
   try {
-    const results = await exa.getContents(urls, { text: { maxCharacters: maxChars } });
-    return { success: true, contents: results.results };
+    for await (const message of query({
+      prompt,
+      options: {
+        ...config,
+        resume: ${sessionIdArg}
+      }
+    })) {
+      // Output each message as JSON for parsing
+      console.log("__RESEARCH_MSG__" + JSON.stringify(message));
+    }
+    console.log("__RESEARCH_DONE__");
   } catch (error) {
-    return { success: false, error: error.message };
-  }
-}
-
-async function main() {
-  const topic = \`${escapedTopic}\`;
-  const sources = [];
-  const contents = [];
-  const seenUrls = new Set();
-
-  // Stage 1: Planning
-  emit({ type: 'stage_change', data: { stage: 'planning', status: 'active', message: 'Analyzing research topic' } });
-  emit({ type: 'status', data: { message: 'Creating search strategy...', stage: 'planning' } });
-
-  const today = new Date().toISOString().split('T')[0];
-  const planResponse = await anthropic.messages.create({
-    model: 'claude-haiku-4-5-20251001',
-    max_tokens: 2048,
-    system: PLANNER_PROMPT,
-    messages: [{
-      role: 'user',
-      content: \`TODAY'S DATE: \${today}\\n\\nCreate a comprehensive search plan for researching this topic: "\${topic}"\\n\\nOutput only the JSON search plan, no additional text.\`
-    }]
-  });
-
-  const planText = planResponse.content[0].text;
-  const jsonMatch = planText.match(/\\{[\\s\\S]*\\}/);
-  if (!jsonMatch) {
-    emit({ type: 'error', data: { message: 'Could not parse search plan', stage: 'planning' } });
+    console.error("__RESEARCH_ERROR__" + (error.message || String(error)));
     process.exit(1);
   }
-
-  const plan = JSON.parse(jsonMatch[0]);
-  emit({ type: 'status', data: { message: \`Generated \${plan.queries.length} search queries\`, stage: 'planning' } });
-  emit({ type: 'stage_change', data: { stage: 'planning', status: 'completed', message: \`Search strategy ready with \${plan.queries.length} queries\` } });
-
-  // Stage 2: Searching
-  emit({ type: 'stage_change', data: { stage: 'searching', status: 'active', message: 'Starting web searches' } });
-
-  for (let i = 0; i < plan.queries.length; i++) {
-    const query = plan.queries[i];
-    const searchType = plan.searchTypes[i] || 'neural';
-    emit({ type: 'status', data: { message: \`Searching: "\${query}"\`, stage: 'searching' } });
-
-    const searchResult = await searchWeb(
-      query,
-      searchType,
-      10,
-      plan.dateRange?.startDate,
-      plan.dateRange?.endDate
-    );
-
-    if (searchResult.success && searchResult.results) {
-      for (const result of searchResult.results) {
-        if (!seenUrls.has(result.url)) {
-          seenUrls.add(result.url);
-          const source = {
-            id: result.id,
-            title: result.title || 'Untitled',
-            url: result.url,
-            publishedDate: result.publishedDate,
-            author: result.author,
-          };
-          sources.push(source);
-          emit({ type: 'source', data: { source } });
-        }
-      }
-    }
-  }
-
-  emit({ type: 'status', data: { message: \`Found \${sources.length} unique sources, fetching content...\`, stage: 'searching' } });
-
-  // Fetch content for top sources
-  const topUrls = sources.slice(0, 8).map(s => s.url);
-  if (topUrls.length > 0) {
-    const contentResult = await getContents(topUrls, 8000);
-    if (contentResult.success && contentResult.contents) {
-      for (const content of contentResult.contents) {
-        contents.push(\`## \${content.title}\\nURL: \${content.url}\\n\\n\${content.text}\`);
-        const source = sources.find(s => s.url === content.url);
-        if (source) {
-          source.snippet = content.text.slice(0, 200) + '...';
-        }
-      }
-    }
-  }
-
-  emit({ type: 'status', data: { message: \`Gathered content from \${contents.length} sources\`, stage: 'searching' } });
-  emit({ type: 'stage_change', data: { stage: 'searching', status: 'completed', message: \`Collected \${sources.length} sources\` } });
-
-  // Stage 3: Writing
-  emit({ type: 'stage_change', data: { stage: 'writing', status: 'active', message: 'Synthesizing research findings' } });
-  emit({ type: 'status', data: { message: 'Generating comprehensive report...', stage: 'writing' } });
-
-  const sourcesContext = contents.join('\\n\\n---\\n\\n');
-  const sourcesList = sources.map((s, i) => \`[\${i + 1}] \${s.title} - \${s.url}\`).join('\\n');
-
-  const writeResponse = await anthropic.messages.create({
-    model: 'claude-haiku-4-5-20251001',
-    max_tokens: 4096,
-    system: WRITER_PROMPT,
-    messages: [{
-      role: 'user',
-      content: \`Write a comprehensive research report on: "\${topic}"\\n\\n## Available Sources\\n\${sourcesList}\\n\\n## Source Content\\n\${sourcesContext}\\n\\nGenerate a thorough, well-structured Markdown report synthesizing these findings.\`
-    }]
-  });
-
-  const report = writeResponse.content[0].text;
-
-  emit({ type: 'status', data: { message: 'Report generation complete', stage: 'writing' } });
-  emit({ type: 'stage_change', data: { stage: 'writing', status: 'completed', message: 'Report ready' } });
-  emit({ type: 'stage_change', data: { stage: 'completed', status: 'completed', message: 'Research complete' } });
-
-  // Final result
-  emit({ type: 'result', data: { report, sources } });
 }
 
-main().catch(err => {
-  emit({ type: 'error', data: { message: err.message } });
-  process.exit(1);
-});
+runResearch();
 `;
 }
 
 /**
- * Run the research pipeline in a Vercel Sandbox container
+ * Run research in a Vercel Sandbox
+ * Returns an async generator that yields messages from the sandbox
  */
-export async function runResearchInSandbox(
-  topic: string,
-  callbacks: SandboxCallbacks
-): Promise<SandboxResult> {
-  // Validate sandbox credentials
-  if (!process.env.VERCEL_TOKEN) {
-    throw new Error('VERCEL_TOKEN is required for sandbox execution');
-  }
-  if (!process.env.VERCEL_PROJECT_ID) {
-    throw new Error('VERCEL_PROJECT_ID is required for sandbox execution');
-  }
+export async function* runResearchInSandbox(
+  options: RunResearchOptions
+): AsyncGenerator<SandboxMessage> {
+  const { topic, sessionId, anthropicApiKey, exaApiKey, onMessage } = options;
 
-  const sandbox = await Sandbox.create({
-    runtime: 'node22',
-    timeout: 300_000, // 5 minutes
-    token: process.env.VERCEL_TOKEN,
-    projectId: process.env.VERCEL_PROJECT_ID,
-    teamId: process.env.VERCEL_TEAM_ID, // Optional, for team projects
-  });
-
-  const allSources: Source[] = [];
+  let sandbox: Sandbox | null = null;
 
   try {
-    // 1. Write package.json and the research script
+    yield { type: "status", data: "Creating sandbox environment...", timestamp: Date.now() };
+
+    // Validate sandbox credentials
+    const token = process.env.VERCEL_TOKEN;
+    if (!token) {
+      throw new Error("VERCEL_TOKEN is required for sandbox execution");
+    }
+    if (!process.env.VERCEL_PROJECT_ID) {
+      throw new Error("VERCEL_PROJECT_ID is required for sandbox execution");
+    }
+
+    // Create sandbox with Node.js runtime
+    sandbox = await Sandbox.create({
+      runtime: "node22",
+      timeout: 300_000, // 5 minutes
+      token,
+      projectId: process.env.VERCEL_PROJECT_ID,
+      teamId: process.env.VERCEL_TEAM_ID,
+    });
+
+    yield { type: "status", data: "Sandbox created, setting up project...", timestamp: Date.now() };
+
+    // Working directory
+    const workDir = "/vercel/sandbox";
+
+    // Create package.json with Agent SDK dependencies
     const packageJson = JSON.stringify({
-      name: 'research-agent',
-      type: 'module',
+      name: "research-runner",
+      version: "1.0.0",
+      type: "commonjs",
       dependencies: {
-        '@anthropic-ai/sdk': '^0.39.0',
-        'exa-js': '^2.0.11',
+        "@anthropic-ai/claude-agent-sdk": "latest",
+        "exa-js": "latest",
+        "zod": "latest"
       }
     }, null, 2);
 
-    const script = generateResearchScript(topic);
+    // Generate the research script
+    const script = getResearchScript(topic, exaApiKey, sessionId);
 
-    await sandbox.writeFiles([
-      { path: 'package.json', content: Buffer.from(packageJson, 'utf-8') },
-      { path: 'index.js', content: Buffer.from(script, 'utf-8') },
-    ]);
+    yield { type: "status", data: "Writing project files...", timestamp: Date.now() };
 
-    // 3. Install dependencies
-    await sandbox.runCommand({
-      cmd: 'npm',
-      args: ['install'],
-      cwd: '/vercel/sandbox',
+    try {
+      await sandbox.writeFiles([
+        { path: `${workDir}/package.json`, content: Buffer.from(packageJson, "utf-8") },
+        { path: `${workDir}/index.js`, content: Buffer.from(script, "utf-8") }
+      ]);
+    } catch (writeError) {
+      const writeErrMsg = writeError instanceof Error ? writeError.message : String(writeError);
+      yield { type: "error", data: `Failed to write files: ${writeErrMsg}`, timestamp: Date.now() };
+      return;
+    }
+
+    yield { type: "status", data: "Installing dependencies...", timestamp: Date.now() };
+
+    // Install dependencies
+    const installResult = await sandbox.runCommand({
+      cmd: "npm",
+      args: ["install", "--loglevel", "info"],
+      cwd: workDir,
+      signal: AbortSignal.timeout(120_000), // 2 minutes
     });
 
-    // 4. Execute the research script
-    const result = await sandbox.runCommand({
-      cmd: 'node',
-      args: ['index.js'],
-      cwd: '/vercel/sandbox',
+    const installStdout = await installResult.stdout();
+    const installStderr = await installResult.stderr();
+
+    if (installResult.exitCode !== 0) {
+      yield { type: "error", data: `npm install failed (exit ${installResult.exitCode}): ${installStderr || installStdout}`, timestamp: Date.now() };
+      return;
+    }
+
+    yield { type: "status", data: "Dependencies installed, starting research...", timestamp: Date.now() };
+
+    // Run the research script
+    const command = await sandbox.runCommand({
+      cmd: "node",
+      args: ["index.js"],
+      cwd: workDir,
       env: {
-        ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY!,
-        EXA_API_KEY: process.env.EXA_API_KEY!,
+        ANTHROPIC_API_KEY: anthropicApiKey,
+        EXA_API_KEY: exaApiKey,
+        PATH: "/vercel/runtimes/node22/bin:/usr/local/bin:/usr/bin:/bin",
       },
+      detached: true,
     });
 
-    // 5. Get output and parse messages
-    const stdout = await result.output('stdout');
-    const stderr = await result.output('stderr');
-
-    let finalReport: string | undefined;
-    const lines = stdout.split('\n');
-
-    for (const line of lines) {
-      if (line.startsWith('__MSG__')) {
+    // Process output line by line
+    const processLine = (line: string) => {
+      if (line.startsWith("__RESEARCH_MSG__")) {
         try {
-          const json = line.replace('__MSG__', '');
-          const message = JSON.parse(json);
-
-          switch (message.type) {
-            case 'stage_change':
-              callbacks.onStageChange(
-                message.data.stage,
-                message.data.status,
-                message.data.message
-              );
-              break;
-            case 'status':
-              callbacks.onStatus(message.data.message, message.data.stage);
-              break;
-            case 'source':
-              allSources.push(message.data.source);
-              callbacks.onSource(message.data.source);
-              break;
-            case 'error':
-              callbacks.onError(message.data.message, message.data.stage);
-              break;
-            case 'result':
-              finalReport = message.data.report;
-              if (message.data.sources) {
-                // Update sources with any additional data from result
-                for (const source of message.data.sources) {
-                  const existing = allSources.find(s => s.id === source.id);
-                  if (existing && source.snippet) {
-                    existing.snippet = source.snippet;
-                  }
-                }
-              }
-              break;
-          }
+          const json = line.substring("__RESEARCH_MSG__".length);
+          const msg: SandboxMessage = {
+            type: "result",
+            data: json,
+            timestamp: Date.now()
+          };
+          onMessage?.(msg);
         } catch {
-          // Skip malformed messages
+          const msg: SandboxMessage = { type: "stdout", data: line, timestamp: Date.now() };
+          onMessage?.(msg);
+        }
+      } else if (line.startsWith("__RESEARCH_DONE__")) {
+        const msg: SandboxMessage = { type: "status", data: "Research complete", timestamp: Date.now() };
+        onMessage?.(msg);
+      } else if (line.startsWith("__RESEARCH_ERROR__")) {
+        const error = line.substring("__RESEARCH_ERROR__".length);
+        const msg: SandboxMessage = { type: "error", data: error, timestamp: Date.now() };
+        onMessage?.(msg);
+      } else if (line.trim()) {
+        const msg: SandboxMessage = { type: "stdout", data: line, timestamp: Date.now() };
+        onMessage?.(msg);
+      }
+    };
+
+    // Wait for command to finish
+    const finished = await command.wait();
+
+    // Process stdout
+    const stdout = await command.stdout();
+    if (stdout) {
+      const lines = stdout.split("\n");
+      for (const line of lines) {
+        if (line.trim()) {
+          processLine(line);
         }
       }
     }
 
-    // Check for errors in stderr
-    if (stderr && stderr.trim()) {
-      console.error('[Sandbox stderr]:', stderr);
+    // Process stderr if any
+    const stderr = await command.stderr();
+    if (stderr) {
+      const stderrMsg: SandboxMessage = { type: "stderr", data: stderr, timestamp: Date.now() };
+      onMessage?.(stderrMsg);
+      if (finished.exitCode !== 0) {
+        yield { type: "error", data: `Script stderr: ${stderr}`, timestamp: Date.now() };
+      }
     }
 
-    if (result.exitCode !== 0) {
-      return {
-        success: false,
-        sources: allSources,
-        error: `Sandbox execution failed with exit code ${result.exitCode}`,
-      };
+    if (finished.exitCode !== 0) {
+      const errorDetails = stderr || stdout || "No output captured";
+      yield { type: "error", data: `Research script failed (exit ${finished.exitCode}): ${errorDetails}`, timestamp: Date.now() };
     }
 
-    return {
-      success: true,
-      report: finalReport,
-      sources: allSources,
-    };
+    yield { type: "status", data: "Sandbox cleanup complete", timestamp: Date.now() };
+
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    yield { type: "error", data: errorMessage, timestamp: Date.now() };
   } finally {
-    await sandbox.stop();
+    // Clean up sandbox
+    if (sandbox) {
+      try {
+        await sandbox.stop();
+      } catch {
+        // Ignore stop errors
+      }
+    }
   }
 }

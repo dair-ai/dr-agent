@@ -1,63 +1,37 @@
 /**
- * Orchestrator configuration for the research pipeline
+ * Research Agent Configuration
+ *
+ * Configuration for the orchestrator using Claude Agent SDK.
  */
 
-export const ORCHESTRATOR_CONFIG = {
-  model: 'claude-sonnet-4-5-20250514' as const,
-  maxTokens: 4096,
+import { exaSearchTools } from "./tools";
+import { SUBAGENTS, ORCHESTRATOR_SYSTEM_PROMPT } from "./subagents";
+
+/**
+ * Research agent configuration for the orchestrator
+ */
+export const researchAgentConfig = {
+  model: "claude-haiku-4-5-20251001" as const,
+  systemPrompt: ORCHESTRATOR_SYSTEM_PROMPT,
+  mcpServers: {
+    "exa-research": exaSearchTools
+  },
+  agents: SUBAGENTS,
+  allowedTools: [
+    "mcp__exa-research__search",
+    "mcp__exa-research__get_contents",
+    "mcp__exa-research__find_similar"
+  ],
+  disallowedTools: ["WebFetch", "WebSearch"],
+  permissionMode: "bypassPermissions" as const
 };
 
-export const ORCHESTRATOR_SYSTEM_PROMPT = `You are a research orchestrator coordinating a 3-stage deep research pipeline:
-
-## Pipeline Stages
-1. **Planning** - Analyze topic, create search strategy
-2. **Searching** - Execute searches, gather sources
-3. **Writing** - Synthesize findings into report
-
-## Your Role
-- Coordinate the pipeline flow
-- Pass appropriate context between stages
-- Handle errors gracefully
-- Ensure quality output at each stage
-
-You do not perform the research directly. You coordinate specialized subagents.`;
-
+/**
+ * Stage descriptions for UI display
+ */
 export const STAGE_DESCRIPTIONS = {
-  planning: 'Analyzing topic and creating search strategy',
-  searching: 'Executing web searches and gathering sources',
-  writing: 'Synthesizing findings into comprehensive report',
-  completed: 'Research complete',
+  orchestrator: 'Initializing research pipeline',
+  planner: 'Analyzing topic and creating search strategy',
+  'web-search': 'Executing web searches and gathering sources',
+  'report-writer': 'Synthesizing findings into comprehensive report',
 } as const;
-
-export const ACADEMIC_DOMAINS = [
-  'arxiv.org',
-  'papers.google.com',
-  'scholar.google.com',
-  'semanticscholar.org',
-  'pubmed.ncbi.nlm.nih.gov',
-  'nature.com',
-  'sciencedirect.com',
-  'ieee.org',
-  'acm.org',
-];
-
-export const TECH_DOMAINS = [
-  'github.com',
-  'huggingface.co',
-  'openai.com',
-  'anthropic.com',
-  'deepmind.com',
-  'pytorch.org',
-  'tensorflow.org',
-  'medium.com',
-  'towardsdatascience.com',
-];
-
-export const NEWS_DOMAINS = [
-  'techcrunch.com',
-  'wired.com',
-  'theverge.com',
-  'arstechnica.com',
-  'venturebeat.com',
-  'thenewstack.io',
-];

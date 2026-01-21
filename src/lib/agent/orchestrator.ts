@@ -1,261 +1,144 @@
-import Anthropic from '@anthropic-ai/sdk';
-import { searchWeb, getContents } from './exa-client';
-import { PLANNER_SUBAGENT, REPORT_WRITER_SUBAGENT } from './subagents';
-import type { Source, SearchPlan, ResearchStage } from '@/types/research';
+/**
+ * Research Pipeline Orchestrator
+ *
+ * Uses Claude Agent SDK query() function to coordinate the multi-agent research pipeline.
+ */
 
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-});
+import { query } from "@anthropic-ai/claude-agent-sdk";
+import { researchAgentConfig } from "./config";
+import type { PipelineStage } from "@/types/research";
 
-export interface OrchestratorCallbacks {
-  onStageChange: (stage: ResearchStage, status: 'active' | 'completed' | 'error', message?: string) => void;
-  onStatus: (message: string, stage: ResearchStage) => void;
-  onSource: (source: Source) => void;
-  onError: (error: string, stage?: ResearchStage) => void;
-}
+/**
+ * Generate the current date/time in ISO format
+ */
+export const getCurrentDateTime = () => new Date().toISOString();
 
-export interface OrchestratorResult {
-  success: boolean;
-  report?: string;
-  sources: Source[];
-  error?: string;
+/**
+ * Research prompt template with current date/time for the planner agent
+ */
+export const RESEARCH_PROMPT_TEMPLATE = (topic: string) => {
+  const currentDateTime = getCurrentDateTime();
+
+  return `Conduct deep research on the following topic and provide a comprehensive report:
+
+**Research Topic:** ${topic}
+
+**Current Date/Time:** ${currentDateTime}
+
+Please use this date/time information to:
+1. Set appropriate date ranges for searching (the planner agent should use this)
+2. Prioritize recent vs historical sources based on the topic
+3. Filter out outdated information when researching current events
+
+Pipeline Instructions:
+1. First, call the planner-agent to create an optimized search strategy with date ranges
+2. Then, pass the search plan to web-search-agent to gather sources
+3. Finally, pass sources to report-writer-agent for the final report
+
+IMPORTANT: Announce each stage transition with "STAGE: [agent-name] - [description]"
+
+Start the research pipeline now.`;
+};
+
+/**
+ * Detect pipeline stage transitions from orchestrator's text output
+ */
+export function detectStageChange(text: string): { stage: PipelineStage; description: string } | null {
+  const stagePatterns: { pattern: RegExp; stage: PipelineStage }[] = [
+    { pattern: /STAGE:\s*planning\s*-?\s*(.+)?/i, stage: "planner" },
+    { pattern: /STAGE:\s*planner\s*-?\s*(.+)?/i, stage: "planner" },
+    { pattern: /STAGE:\s*searching\s*-?\s*(.+)?/i, stage: "web-search" },
+    { pattern: /STAGE:\s*web-search\s*-?\s*(.+)?/i, stage: "web-search" },
+    { pattern: /STAGE:\s*writing\s*-?\s*(.+)?/i, stage: "report-writer" },
+    { pattern: /STAGE:\s*report-writer\s*-?\s*(.+)?/i, stage: "report-writer" }
+  ];
+
+  for (const { pattern, stage } of stagePatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      return {
+        stage,
+        description: match[1]?.trim() || `Starting ${stage} stage`
+      };
+    }
+  }
+
+  return null;
 }
 
 /**
- * Run the planning stage
+ * Run the research pipeline using Claude Agent SDK
+ *
+ * This is an async generator that yields Agent SDK messages.
+ * Use this for local development (direct execution).
  */
-async function runPlanningStage(
-  topic: string,
-  callbacks: OrchestratorCallbacks
-): Promise<SearchPlan | null> {
-  callbacks.onStageChange('planning', 'active', 'Analyzing research topic');
-  callbacks.onStatus('Creating search strategy...', 'planning');
+export async function* runResearchPipeline(topic: string, sessionId?: string) {
+  const prompt = RESEARCH_PROMPT_TEMPLATE(topic);
 
-  try {
-    const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD format
-
-    const response = await anthropic.messages.create({
-      model: PLANNER_SUBAGENT.model,
-      max_tokens: 2048,
-      system: PLANNER_SUBAGENT.systemPrompt,
-      messages: [
-        {
-          role: 'user',
-          content: `TODAY'S DATE: ${today}
-
-Create a comprehensive search plan for researching this topic: "${topic}"
-
-Output only the JSON search plan, no additional text.`,
-        },
-      ],
-    });
-
-    const content = response.content[0];
-    if (content.type !== 'text') {
-      throw new Error('Unexpected response type from planner');
+  for await (const message of query({
+    prompt,
+    options: {
+      ...researchAgentConfig,
+      resume: sessionId,
     }
-
-    // Parse the JSON plan from the response
-    const jsonMatch = content.text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      throw new Error('Could not parse search plan from response');
-    }
-
-    const plan: SearchPlan = JSON.parse(jsonMatch[0]);
-
-    callbacks.onStatus(`Generated ${plan.queries.length} search queries`, 'planning');
-    callbacks.onStageChange('planning', 'completed', `Search strategy ready with ${plan.queries.length} queries`);
-
-    return plan;
-  } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : 'Planning failed';
-    callbacks.onStageChange('planning', 'error', errorMsg);
-    callbacks.onError(errorMsg, 'planning');
-    return null;
+  })) {
+    yield message;
   }
 }
 
 /**
- * Run the web search stage
+ * Extract text content from an Agent SDK message
  */
-async function runSearchStage(
-  topic: string,
-  plan: SearchPlan,
-  callbacks: OrchestratorCallbacks
-): Promise<{ sources: Source[]; contents: string[] } | null> {
-  callbacks.onStageChange('searching', 'active', 'Starting web searches');
+export function extractTextFromMessage(message: { type: string; message?: { content?: unknown[] } }): string {
+  if (message.type !== "assistant" || !message.message?.content) {
+    return "";
+  }
 
-  const sources: Source[] = [];
-  const contents: string[] = [];
-  const seenUrls = new Set<string>();
+  const content = message.message.content;
+  if (!Array.isArray(content)) {
+    return "";
+  }
 
-  try {
-    // Execute searches
-    console.log('[DEBUG] Starting searches with plan:', JSON.stringify(plan, null, 2));
-    for (let i = 0; i < plan.queries.length; i++) {
-      const query = plan.queries[i];
-      const searchType = plan.searchTypes[i] || 'neural';
+  return content
+    .filter((block): block is { type: "text"; text: string } =>
+      typeof block === "object" && block !== null && "type" in block && block.type === "text"
+    )
+    .map(block => block.text)
+    .join("\n");
+}
 
-      console.log(`[DEBUG] Executing search ${i + 1}/${plan.queries.length}: "${query}" (${searchType})`);
-      callbacks.onStatus(`Searching: "${query}"`, 'searching');
+/**
+ * Check if an Agent SDK message contains a subagent call
+ */
+export function getSubagentCall(message: { type: string; message?: { content?: unknown[] } }): { subagent_type: string; description: string } | null {
+  if (message.type !== "assistant" || !message.message?.content) {
+    return null;
+  }
 
-      // Use date filtering for time-sensitive queries, otherwise let Exa find best sources
-      const searchResult = await searchWeb({
-        query,
-        type: searchType,
-        numResults: 10,
-        startPublishedDate: plan.dateRange?.startDate,
-        endPublishedDate: plan.dateRange?.endDate,
-      });
+  const content = message.message.content;
+  if (!Array.isArray(content)) {
+    return null;
+  }
 
-      console.log(`[DEBUG] Search result: success=${searchResult.success}, results=${searchResult.results?.length || 0}, error=${searchResult.error || 'none'}`);
-      if (searchResult.success && searchResult.results) {
-        for (const result of searchResult.results) {
-          if (!seenUrls.has(result.url)) {
-            seenUrls.add(result.url);
-            const source: Source = {
-              id: result.id,
-              title: result.title,
-              url: result.url,
-              publishedDate: result.publishedDate,
-              author: result.author,
-            };
-            sources.push(source);
-            callbacks.onSource(source);
-          }
-        }
-      } else {
-        console.error(`[Exa Search Failed] Query: "${query}" - Error: ${searchResult.error || 'Unknown error'}`);
-        callbacks.onStatus(`Search failed for "${query}": ${searchResult.error || 'Unknown error'}`, 'searching');
+  for (const block of content) {
+    if (
+      typeof block === "object" &&
+      block !== null &&
+      "type" in block &&
+      block.type === "tool_use" &&
+      "name" in block &&
+      block.name === "Task" &&
+      "input" in block
+    ) {
+      const input = block.input as { subagent_type?: string; description?: string };
+      if (input.subagent_type) {
+        return {
+          subagent_type: input.subagent_type,
+          description: input.description || `Running ${input.subagent_type}`
+        };
       }
     }
-
-    callbacks.onStatus(`Found ${sources.length} unique sources, fetching content...`, 'searching');
-
-    // Fetch full content for top sources (limit to 8)
-    const topSources = sources.slice(0, 8);
-    const urls = topSources.map(s => s.url);
-
-    if (urls.length > 0) {
-      const contentResult = await getContents({
-        urls,
-        maxCharacters: 8000,
-      });
-
-      if (contentResult.success && contentResult.contents) {
-        for (const content of contentResult.contents) {
-          contents.push(`## ${content.title}\nURL: ${content.url}\n\n${content.text}`);
-
-          // Update source with snippet
-          const source = sources.find(s => s.url === content.url);
-          if (source) {
-            source.snippet = content.text.slice(0, 200) + '...';
-          }
-        }
-      }
-    }
-
-    callbacks.onStatus(`Gathered content from ${contents.length} sources`, 'searching');
-    callbacks.onStageChange('searching', 'completed', `Collected ${sources.length} sources`);
-
-    return { sources, contents };
-  } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : 'Search failed';
-    callbacks.onStageChange('searching', 'error', errorMsg);
-    callbacks.onError(errorMsg, 'searching');
-    return null;
-  }
-}
-
-/**
- * Run the report writing stage
- */
-async function runWritingStage(
-  topic: string,
-  sources: Source[],
-  contents: string[],
-  callbacks: OrchestratorCallbacks
-): Promise<string | null> {
-  callbacks.onStageChange('writing', 'active', 'Synthesizing research findings');
-  callbacks.onStatus('Generating comprehensive report...', 'writing');
-
-  try {
-    const sourcesContext = contents.join('\n\n---\n\n');
-    const sourcesList = sources
-      .map((s, i) => `[${i + 1}] ${s.title} - ${s.url}`)
-      .join('\n');
-
-    const response = await anthropic.messages.create({
-      model: REPORT_WRITER_SUBAGENT.model,
-      max_tokens: 4096,
-      system: REPORT_WRITER_SUBAGENT.systemPrompt,
-      messages: [
-        {
-          role: 'user',
-          content: `Write a comprehensive research report on: "${topic}"
-
-## Available Sources
-${sourcesList}
-
-## Source Content
-${sourcesContext}
-
-Generate a thorough, well-structured Markdown report synthesizing these findings.`,
-        },
-      ],
-    });
-
-    const content = response.content[0];
-    if (content.type !== 'text') {
-      throw new Error('Unexpected response type from report writer');
-    }
-
-    callbacks.onStatus('Report generation complete', 'writing');
-    callbacks.onStageChange('writing', 'completed', 'Report ready');
-
-    return content.text;
-  } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : 'Report writing failed';
-    callbacks.onStageChange('writing', 'error', errorMsg);
-    callbacks.onError(errorMsg, 'writing');
-    return null;
-  }
-}
-
-/**
- * Main orchestrator function that runs the full research pipeline
- */
-export async function runResearchPipeline(
-  topic: string,
-  callbacks: OrchestratorCallbacks
-): Promise<OrchestratorResult> {
-  const allSources: Source[] = [];
-
-  // Stage 1: Planning
-  const plan = await runPlanningStage(topic, callbacks);
-  if (!plan) {
-    return { success: false, sources: [], error: 'Planning stage failed' };
   }
 
-  // Stage 2: Web Search
-  const searchResults = await runSearchStage(topic, plan, callbacks);
-  if (!searchResults) {
-    return { success: false, sources: allSources, error: 'Search stage failed' };
-  }
-  allSources.push(...searchResults.sources);
-
-  // Stage 3: Report Writing
-  const report = await runWritingStage(topic, searchResults.sources, searchResults.contents, callbacks);
-  if (!report) {
-    return { success: false, sources: allSources, error: 'Report writing stage failed' };
-  }
-
-  // Mark pipeline as completed
-  callbacks.onStageChange('completed', 'completed', 'Research complete');
-
-  return {
-    success: true,
-    report,
-    sources: allSources,
-  };
+  return null;
 }

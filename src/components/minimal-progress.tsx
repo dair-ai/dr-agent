@@ -1,28 +1,27 @@
 'use client';
 
-import { cn } from '@/lib/utils';
-import type { ResearchStage, StageProgress } from '@/types/research';
+import type { PipelineStage, StageProgress } from '@/types/research';
 
 interface MinimalProgressProps {
-  stages: Record<ResearchStage, StageProgress>;
-  currentStage: ResearchStage | null;
+  stages: Record<PipelineStage, StageProgress>;
+  currentStage: PipelineStage | null;
 }
 
-const stageLabels: Record<ResearchStage, { active: string; completed: string }> = {
-  planning: { active: 'Planning research...', completed: 'Plan ready' },
-  searching: { active: 'Searching sources...', completed: 'Sources found' },
-  writing: { active: 'Writing report...', completed: 'Report ready' },
-  completed: { active: 'Finalizing...', completed: 'Complete' },
+const stageLabels: Record<PipelineStage, { active: string; completed: string }> = {
+  orchestrator: { active: 'Starting research...', completed: 'Initialized' },
+  planner: { active: 'Planning research...', completed: 'Plan ready' },
+  'web-search': { active: 'Searching sources...', completed: 'Sources found' },
+  'report-writer': { active: 'Writing report...', completed: 'Report ready' },
 };
 
-const stageOrder: ResearchStage[] = ['planning', 'searching', 'writing', 'completed'];
+const stageOrder: PipelineStage[] = ['orchestrator', 'planner', 'web-search', 'report-writer'];
 
-function getStageNumber(stage: ResearchStage): number {
+function getStageNumber(stage: PipelineStage): number {
   return stageOrder.indexOf(stage) + 1;
 }
 
 export function MinimalProgress({ stages, currentStage }: MinimalProgressProps) {
-  const isCompleted = stages.completed?.status === 'completed';
+  const isCompleted = stages['report-writer']?.status === 'completed';
   const hasError = Object.values(stages).some(s => s.status === 'error');
 
   if (hasError) {
@@ -62,7 +61,7 @@ export function MinimalProgress({ stages, currentStage }: MinimalProgressProps) 
   }
 
   const stageNum = getStageNumber(currentStage);
-  const totalStages = stageOrder.length - 1; // Don't count 'completed' as a stage
+  const totalStages = stageOrder.length;
   const label = stageLabels[currentStage];
 
   return (
@@ -88,11 +87,9 @@ export function MinimalProgress({ stages, currentStage }: MinimalProgressProps) 
       </svg>
       <span>
         {label.active}
-        {currentStage !== 'completed' && (
-          <span className="text-gray-400 ml-1">
-            ({stageNum}/{totalStages})
-          </span>
-        )}
+        <span className="text-gray-400 ml-1">
+          ({stageNum}/{totalStages})
+        </span>
       </span>
     </div>
   );
