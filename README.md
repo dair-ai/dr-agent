@@ -2,7 +2,20 @@ This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-
 
 ## Getting Started
 
-First, run the development server:
+### Environment Setup
+
+Copy the example environment file and add your API keys:
+
+```bash
+cp .env.example .env.local
+```
+
+Then edit `.env.local` and add your keys:
+
+- `ANTHROPIC_API_KEY` - Get your key at [console.anthropic.com](https://console.anthropic.com/)
+- `EXA_API_KEY` - Get your key at [exa.ai](https://exa.ai/)
+
+### Run the Development Server
 
 ```bash
 npm run dev
