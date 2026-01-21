@@ -63,11 +63,11 @@ export interface ErrorEvent {
 export interface SearchPlan {
   queries: string[];
   searchTypes: ('neural' | 'keyword')[];
-  domains?: string[];
+  isTimeSensitive?: boolean;
   dateRange?: {
     startDate?: string;
     endDate?: string;
-  };
+  } | null;
   rationale: string;
 }
 

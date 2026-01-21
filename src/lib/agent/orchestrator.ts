@@ -32,6 +32,8 @@ async function runPlanningStage(
   callbacks.onStatus('Creating search strategy...', 'planning');
 
   try {
+    const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD format
+
     const response = await anthropic.messages.create({
       model: PLANNER_SUBAGENT.model,
       max_tokens: 2048,
@@ -39,7 +41,9 @@ async function runPlanningStage(
       messages: [
         {
           role: 'user',
-          content: `Create a comprehensive search plan for researching this topic: "${topic}"
+          content: `TODAY'S DATE: ${today}
+
+Create a comprehensive search plan for researching this topic: "${topic}"
 
 Output only the JSON search plan, no additional text.`,
         },
@@ -87,21 +91,24 @@ async function runSearchStage(
 
   try {
     // Execute searches
+    console.log('[DEBUG] Starting searches with plan:', JSON.stringify(plan, null, 2));
     for (let i = 0; i < plan.queries.length; i++) {
       const query = plan.queries[i];
       const searchType = plan.searchTypes[i] || 'neural';
 
+      console.log(`[DEBUG] Executing search ${i + 1}/${plan.queries.length}: "${query}" (${searchType})`);
       callbacks.onStatus(`Searching: "${query}"`, 'searching');
 
+      // Use date filtering for time-sensitive queries, otherwise let Exa find best sources
       const searchResult = await searchWeb({
         query,
         type: searchType,
-        numResults: 5,
-        includeDomains: plan.domains,
+        numResults: 10,
         startPublishedDate: plan.dateRange?.startDate,
         endPublishedDate: plan.dateRange?.endDate,
       });
 
+      console.log(`[DEBUG] Search result: success=${searchResult.success}, results=${searchResult.results?.length || 0}, error=${searchResult.error || 'none'}`);
       if (searchResult.success && searchResult.results) {
         for (const result of searchResult.results) {
           if (!seenUrls.has(result.url)) {
@@ -117,6 +124,9 @@ async function runSearchStage(
             callbacks.onSource(source);
           }
         }
+      } else {
+        console.error(`[Exa Search Failed] Query: "${query}" - Error: ${searchResult.error || 'Unknown error'}`);
+        callbacks.onStatus(`Search failed for "${query}": ${searchResult.error || 'Unknown error'}`, 'searching');
       }
     }
 
